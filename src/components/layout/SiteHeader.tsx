@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -35,7 +36,17 @@ export function SiteHeader() {
           className="group flex items-center gap-2.5"
           aria-label={`${site.name} — home`}
         >
-          <Mark />
+          <span className="size-8 shrink-0 overflow-hidden rounded-full ring-1 ring-line-2 transition-shadow group-hover:ring-accent/60">
+            {/* Zoomed toward the face: the source photo has a lot of background. */}
+            <Image
+              src="/zakariya-raji.jpg"
+              alt=""
+              width={64}
+              height={64}
+              priority
+              className="size-full origin-[57%_55%] scale-[1.7] object-cover"
+            />
+          </span>
           <span className="text-sm font-semibold tracking-tight text-fg">{site.name}</span>
         </Link>
 
