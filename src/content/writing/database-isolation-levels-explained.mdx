@@ -1,0 +1,71 @@
+Isolation levels are usually explained with abstract anomalies. They make more sense with money.
+
+The examples use PostgreSQL, where the default is `READ COMMITTED`.
+
+## The lost update
+
+Account A has ₦10,000. Two withdrawals of ₦7,000 arrive at once.
+
+```text
+T1: SELECT balance FROM accounts WHERE id = 'A';   -- 10,000
+T2: SELECT balance FROM accounts WHERE id = 'A';   -- 10,000
+T1: -- 10,000 ≥ 7,000, ok
+T2: -- 10,000 ≥ 7,000, ok
+T1: UPDATE accounts SET balance = 3000 WHERE id = 'A';
+T2: UPDATE accounts SET balance = 3000 WHERE id = 'A';
+T1: COMMIT;
+T2: COMMIT;
+```
+
+₦14,000 left the system; the balance says ₦3,000. Under `READ COMMITTED` this is allowed: each statement saw committed data, but the read-modify-write was not atomic.
+
+## Three fixes
+
+**1. Make the write conditional.** Let the database do the arithmetic and the check:
+
+```sql
+UPDATE accounts
+SET    balance = balance - 7000
+WHERE  id = 'A' AND balance >= 7000;
+```
+
+Check the affected row count. Zero means insufficient funds. This is often the simplest correct answer.
+
+**2. Pessimistic locking.** Lock the row before reading it:
+
+```sql
+SELECT balance FROM accounts WHERE id = 'A' FOR UPDATE;
+```
+
+T2 blocks until T1 commits, then reads the new balance. Correct and easy to reason about; the cost is contention on hot rows. Always lock multiple accounts in a consistent order (for example, sorted by ID) to avoid deadlocks.
+
+**3. Optimistic concurrency.** Read a version, write only if it has not changed:
+
+```sql
+UPDATE account_balances
+SET    balance_minor = $new, version = version + 1
+WHERE  account_id = 'A' AND version = $read_version;
+```
+
+Zero rows updated means someone else won; retry. Excellent under low contention, wasteful under high.
+
+## Write skew
+
+A business rule spans two rows: a customer's two accounts must have a combined balance ≥ 0. Two transactions each withdraw from a _different_ account, each checks the combined balance, each sees it is fine.
+
+Neither transaction touched the row the other wrote, so row locks on the written row do not help, and `REPEATABLE READ` in PostgreSQL does not prevent it either. This is write skew.
+
+`SERIALIZABLE` does prevent it — PostgreSQL detects the dangerous dependency and aborts one transaction with a serialization failure. Your code must be prepared to **retry** on SQLSTATE `40001`.
+
+## A practical summary
+
+| Anomaly             | READ COMMITTED | REPEATABLE READ | SERIALIZABLE |
+| ------------------- | -------------- | --------------- | ------------ |
+| Dirty read          | prevented      | prevented       | prevented    |
+| Non-repeatable read | possible       | prevented       | prevented    |
+| Lost update         | possible       | prevented\*     | prevented    |
+| Write skew          | possible       | possible        | prevented    |
+
+\* In PostgreSQL, `REPEATABLE READ` aborts the second writer with a serialization error rather than silently losing the update.
+
+Most financial code stays at `READ COMMITTED` and uses conditional updates, explicit row locks or version columns where it matters. Reach for `SERIALIZABLE` when invariants span rows — and write the retry loop first.

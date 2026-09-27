@@ -1,0 +1,66 @@
+Kafka is a good fit for financial event streams: durable, ordered within a partition, replayable. It is also easy to use in a way that quietly loses or duplicates money.
+
+## Ordering is per partition
+
+Kafka guarantees order within a partition, not across a topic. If `debit` and `reversal` for the same account land on different partitions, a consumer can see the reversal first.
+
+So choose the key deliberately. The default partitioner hashes the key (murmur2) and takes it modulo the partition count:
+
+```text
+partition = murmur2(key) mod partitions
+```
+
+Key by the entity whose events must stay ordered — usually the account ID. All events for one account then go to one partition, in order.
+
+Two consequences:
+
+- **Hot keys** become hot partitions. A settlement account that appears in every transaction will concentrate load.
+- **Changing the partition count** remaps keys. Plan capacity up front.
+
+## The dual-write problem
+
+A service writes a transaction to PostgreSQL and then publishes an event. If it crashes between the two, the database and the stream disagree.
+
+Use a **transactional outbox**: insert the event into an `outbox` table in the same database transaction as the business write. A relay reads the outbox and publishes to Kafka, marking rows as sent. The event is published _at least once_, and only if the transaction committed.
+
+## Offsets and at-least-once
+
+A consumer that commits its offset before processing can lose a message if it crashes. A consumer that commits after processing can process a message twice if it crashes before committing.
+
+Choose the second, and make processing idempotent:
+
+```sql
+INSERT INTO settlements (event_id, account_id, amount_minor)
+VALUES ($1, $2, $3)
+ON CONFLICT (event_id) DO NOTHING;
+```
+
+Duplicates become harmless. This is what people usually mean by "exactly-once" in practice: at-least-once delivery plus idempotent effects.
+
+## Consumer groups and rebalancing
+
+Partitions are divided among the consumers in a group. Add a consumer and partitions move. During a rebalance, a consumer may lose a partition after processing a batch but before committing — the next owner processes that batch again. Idempotency, again, is what makes this safe.
+
+A group can have at most as many active consumers as there are partitions.
+
+## Failures: retry topics and DLQs
+
+A message that fails because a dependency is down should be retried. A message that fails because it is malformed will never succeed.
+
+Retrying in place blocks the partition. Instead:
+
+1. On a transient failure, publish to `topic.retry.1` with a delay, commit, move on.
+2. After N attempts, publish to `topic.dlq` with the payload, error and attempt history.
+3. Build tooling to inspect and **replay** DLQ messages.
+
+The catch: moving a message out of the main partition breaks ordering for that key. Where order is essential — ledger postings, for example — park the key instead: hold subsequent messages for that key until the failed one is resolved.
+
+## Checklist
+
+- Key by the entity that needs ordering.
+- Publish through an outbox.
+- Commit offsets after durable writes.
+- Make every consumer idempotent.
+- Retry via topics, not sleeps.
+- Keep DLQs replayable.
+- Alert on consumer lag, not just errors.

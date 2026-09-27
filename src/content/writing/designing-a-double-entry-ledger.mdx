@@ -1,0 +1,87 @@
+Most systems that handle money start with a `balance` column on an `accounts` table. It works until the first dispute, when someone asks _why_ the balance is what it is, and the only honest answer is "because the last `UPDATE` said so."
+
+A ledger answers that question by construction.
+
+## The one rule
+
+Money is never created or destroyed inside the system. It only moves between accounts. Every movement is recorded as a **journal entry** made of two or more **lines**, and the lines of an entry must sum to zero.
+
+```text
+entry  tx_01H9…  "Transfer A → B"
+  line  debit   customer:A   10,000.00
+  line  credit  customer:B   10,000.00
+                             ─────────
+                                  0.00
+```
+
+If a proposed entry does not balance, it is rejected. That single check eliminates an entire class of bugs where money appears from nowhere.
+
+## Debits, credits and normal balances
+
+Debit and credit are not "minus" and "plus." They are sides. Whether a debit increases or decreases an account depends on the account's **normal balance**:
+
+| Account type | Normal balance | Debit    | Credit   |
+| ------------ | -------------- | -------- | -------- |
+| Asset        | Debit          | increase | decrease |
+| Expense      | Debit          | increase | decrease |
+| Liability    | Credit         | decrease | increase |
+| Equity       | Credit         | decrease | increase |
+| Revenue      | Credit         | decrease | increase |
+
+A customer's deposit account is a **liability** from the bank's point of view — the bank owes that money to the customer. So crediting a customer account increases what they see as their balance. Encode the normal balance on the account type and compute signed amounts in one place; do not scatter `if (type == …)` through the codebase.
+
+## Store amounts as integers
+
+Use integer minor units (kobo, cents) and a currency code. Never floating point. Where currencies have different minor units, store the exponent with the currency, not the amount.
+
+```sql
+CREATE TABLE journal_lines (
+  id           bigserial PRIMARY KEY,
+  entry_id     uuid        NOT NULL REFERENCES journal_entries(id),
+  account_id   uuid        NOT NULL REFERENCES accounts(id),
+  side         text        NOT NULL CHECK (side IN ('debit', 'credit')),
+  amount_minor bigint      NOT NULL CHECK (amount_minor > 0),
+  currency     char(3)     NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+```
+
+## Balances are a projection
+
+The balance of an account is the sum of its lines. You can compute that on every read, but as history grows you will want a projection:
+
+```sql
+CREATE TABLE account_balances (
+  account_id    uuid   PRIMARY KEY REFERENCES accounts(id),
+  balance_minor bigint NOT NULL,
+  version       bigint NOT NULL
+);
+```
+
+The projection is updated **in the same database transaction** as the journal lines. Both commit or neither does. The `version` column gives you optimistic concurrency: an update that finds a different version than it read is retried.
+
+Because the projection is derived, it can always be rebuilt and verified from the journal. Run that verification regularly.
+
+## Never update history
+
+Journal lines are append-only. A mistaken posting is corrected by a **reversal** — a new entry with the sides swapped, linked to the original. The mistake and its correction both remain visible, which is exactly what an auditor wants to see.
+
+## Holds
+
+Card authorisations, pending transfers and withdrawals-in-flight reserve money that has not moved yet. Model holds explicitly:
+
+```text
+available balance = ledger balance − sum(active holds)
+```
+
+A hold is captured (becomes a posting) or released (expires or is cancelled). Treating holds as a separate concept keeps the journal clean: it records only money that actually moved.
+
+## Invariants worth testing
+
+- Every entry sums to zero, per currency.
+- Total debits equal total credits across the ledger (trial balance).
+- Every projection equals the sum of its account's lines.
+- No line is ever updated or deleted.
+- A replayed request with the same idempotency key produces no new lines.
+
+Put as many of these as possible in the database as constraints. Code paths multiply; constraints do not.

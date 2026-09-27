@@ -1,0 +1,69 @@
+A client sends a payment request. The connection drops before the response arrives. Did the payment happen?
+
+The client cannot know, so it retries. If your API is not idempotent, the customer pays twice.
+
+## Idempotency keys
+
+The client generates a unique key per logical operation and sends it with every attempt:
+
+```http
+POST /v1/transfers
+Idempotency-Key: 5f1c2a9e-7b3d-4c1e-9a6f-2d8e4b7c1a03
+Content-Type: application/json
+
+{ "from": "acc_A", "to": "acc_B", "amount_minor": 1000000, "currency": "NGN" }
+```
+
+The server stores the key with the outcome. A repeated request with the same key returns the stored outcome instead of executing again.
+
+## What exactly do you store?
+
+Three things:
+
+1. **The key**, with a unique constraint.
+2. **A fingerprint of the request** — a hash of the canonicalised body.
+3. **The response** — status code and body — once there is one.
+
+The fingerprint matters. If a client reuses a key with a _different_ body, that is a client bug, and silently returning the first response hides it. Reject it with `422` instead.
+
+```text
+same key, same fingerprint, completed  → return stored response
+same key, same fingerprint, in flight  → 409, retry later
+same key, different fingerprint        → 422
+new key                                → execute
+```
+
+## The race
+
+Two identical requests arrive at the same time on different instances. Both check for the key, both find nothing, both execute.
+
+The fix is to claim the key **before** doing the work, using the database's unique constraint as the arbiter:
+
+```sql
+INSERT INTO idempotency_keys (key, fingerprint, status)
+VALUES ($1, $2, 'in_flight')
+ON CONFLICT (key) DO NOTHING
+RETURNING key;
+```
+
+If the insert returns nothing, someone else owns the key. A Redis `SET NX` in front can shed duplicate load cheaply, but the durable constraint is what guarantees correctness.
+
+## Idempotency is end-to-end
+
+An idempotent API does not help if the worker behind it calls the provider twice. Every hop needs its own guarantee:
+
+- **API → service:** idempotency key.
+- **Service → provider:** a stable client reference per payment, reused on retry, if the provider supports it.
+- **Provider → webhook:** deduplicate by provider reference.
+- **Kafka → consumer:** idempotent upsert keyed by event ID.
+- **Service → ledger:** unique constraint on the posting's source reference.
+
+## Timeouts are not failures
+
+When a provider call times out, you do not know whether it succeeded. Marking the payment `FAILED` and letting the customer retry is how double payments happen.
+
+Mark it `UNKNOWN`. Resolve it by querying the provider's status endpoint, waiting for the webhook, or — as a last resort — reconciliation. Only fail over to another provider when you can prove the first one did not accept the payment.
+
+## Expiry
+
+Keys cannot live forever. Keep them at least as long as any client could plausibly retry — typically 24 hours to several days — and document the window. After expiry, the ledger's own uniqueness on source references is the last line of defence.
