@@ -8,10 +8,10 @@ export function SiteFooter() {
     <footer className="no-print mt-24 border-t border-line">
       <Container className="grid gap-10 py-12 md:grid-cols-[1.4fr_1fr_1fr]">
         <div>
-          <div className="flex items-center gap-2.5">
+          {/* <div className="flex items-center gap-2.5">
             <Mark />
             <span className="text-sm font-semibold">{site.name}</span>
-          </div>
+          </div> */}
           <p className="mt-4 max-w-sm font-mono text-xs leading-relaxed text-fg-3">
             {site.principle}
           </p>
